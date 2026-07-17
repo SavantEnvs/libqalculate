@@ -1,0 +1,10 @@
+# libFuzzer target: /mayhem/libqalculate-fuzz is compiled with -fsanitize=fuzzer. `libfuzzer: true` tells
+# Mayhem to drive it as a libFuzzer harness (the engine delivers inputs) — without it Mayhem can't
+# run it (0 edges). The harness feeds raw bytes to Calculator::calculate (the expression
+# parser/evaluator) and then prints the result. (Target name preserves the original integration's.)
+project: savantenvs/libqalculate
+target: libqalculate
+
+cmds:
+  - cmd: /mayhem/libqalculate-fuzz
+    libfuzzer: true
