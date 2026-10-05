@@ -1,0 +1,137 @@
+# The Mayhem worker for a BACKPORT branch (repro-<UPSTREAM7>) — copied verbatim from the workflow
+# repo's mayhem-repo-backport/ overlay; verify-backport.sh requires it byte-for-byte, so never edit it
+# here. Build the commit image from mayhem/Dockerfile, push it to ghcr, then run Mayhem over every
+# mayhem/Mayhemfile* (the matrix is listed at run time), each run seeded with the crashers of its
+# Mayhemfile's `# origin:` run — downloaded onto the runner, never into the branch or the image — via
+# `--testsuite file://<them> --regression`: it replays the original run's
+# crashers and runs no other task (no fuzzing). No --duration: the replay runs every test case
+# (BACKPORT.md step 6). Runs only on an explicit dispatch; `target` re-runs a single backport target:
+#   gh workflow run mayhem.yml --ref repro-<UPSTREAM7> [-f target=<target>]
+# (`workflow_call` is kept only for the shared spec contract; nothing calls it — a backport has no sync.yml.)
+name: Mayhem
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Replay only this backport target (default: every Mayhemfile).'
+        type: string
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      target:
+        description: replay only this backport target
+        type: string
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:                           # first in the file: spec-check reads the FIRST checkout's fetch-depth
+    name: build commit image
+    needs: mayhemfiles             # a mistyped `target` fails before the image is built
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 0          # the Dockerfile COPYs .git into /mayhem: the image needs full history
+
+      - name: Resolve build SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: type=raw,value=commit-${{ steps.sha.outputs.sha }}
+
+      - name: Build and push (mayhem/Dockerfile)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: mayhem/Dockerfile
+          push: true
+          build-args: |
+            COMMIT=${{ steps.sha.outputs.sha }}
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      ref: ${{ steps.sha.outputs.sha }}
+
+  mayhemfiles:
+    name: list Mayhemfiles
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.ls.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: One matrix entry per mayhem/Mayhemfile* (only `target`'s, if given)
+        id: ls
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          m=$(for f in mayhem/Mayhemfile*; do
+                t=$(sed -nE 's/^[[:space:]]*target:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f" | head -1)
+                o=$(sed -nE 's|^#[[:space:]]*origin:[[:space:]]*https://app\.mayhem\.security/([^/[:space:]]+/[^/[:space:]]+/[^/[:space:]]+/[0-9]+)[[:space:]]*$|\1|p' "$f" | head -1)
+                if [ -z "$TARGET" ] || [ "$t" = "$TARGET" ]; then printf '%s\t%s\t%s\n' "$f" "$t" "$o"; fi
+              done | jq -R -s -c '{include: split("\n") | map(select(length > 0) | split("\t") | {mayhemfile: .[0], target: .[1], origin: .[2]})}')
+          if [ "$(jq '.include | length' <<<"$m")" -eq 0 ]; then
+            echo "::error::no mayhem/Mayhemfile* has target '$TARGET'"; exit 1
+          fi
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
+  mayhem:
+    needs: [build, mayhemfiles]
+    name: 'replay ${{ matrix.target }}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.mayhemfiles.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.build.outputs.ref }}
+      - name: Download the crashers of ${{ matrix.origin }}
+        shell: bash
+        env:
+          MAYHEM_TOKEN: ${{ secrets.MAYHEM_TOKEN }}
+          ORIGIN: ${{ matrix.origin }}
+        run: |
+          [ -n "$ORIGIN" ] || { echo "::error file=${{ matrix.mayhemfile }}::no '# origin: https://app.mayhem.security/<org>/<project>/<target>/<run>' line"; exit 1; }
+          IFS=/ read -r org project target run <<<"$ORIGIN"
+          d="$RUNNER_TEMP/crashers" && mkdir -p "$d"
+          curl -fsSL --retry 3 -H "X-Mayhem-Token: token $MAYHEM_TOKEN" \
+            "https://app.mayhem.security/api/v2/owner/$org/project/$project/target/$target/testsuite.tar?run_number=$run&defects_only=true" \
+            | tar -x -C "$d"
+          n=0
+          for f in "$d"/*; do
+            [ -f "$f" ] || continue
+            [ "$(sha256sum < "$f" | cut -c1-64)" = "${f##*/}" ] || { echo "::error::${f##*/} does not hash to its name"; exit 1; }
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no crashing test cases in $ORIGIN"; exit 1; }
+          echo "$n crashing test case(s) from https://app.mayhem.security/$ORIGIN"
+      - name: Replay them on the commit image (${{ matrix.target }})
+        uses: ForAllSecure/mcode-action@08516a896b38a6d4955bceb640c21908ec0c416b # v1.0.12
+        with:
+          mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
+          args: --image ${{ needs.build.outputs.image }} --file ${{ matrix.mayhemfile }} --testsuite file://${{ runner.temp }}/crashers --regression
